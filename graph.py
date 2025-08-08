@@ -1,4 +1,8 @@
 import os
+import base64
+import io
+import argparse
+import sys
 from dotenv import load_dotenv 
 from langchain_deepseek import ChatDeepSeek
 from langgraph.prebuilt import create_react_agent
@@ -11,6 +15,9 @@ import seaborn as sns
 import pandas as pd
 import pymysql
 from langchain_tavily import TavilySearch
+
+# 默认图片输出目录（可通过环境变量 IMAGE_OUTPUT_DIR 或命令行 --images_dir 覆盖）
+IMAGE_OUTPUT_DIR = os.getenv("IMAGE_OUTPUT_DIR") or os.path.join(os.getcwd(), "images")
 
 # 加载环境变量
 load_dotenv(override=True)
@@ -119,6 +126,70 @@ def extract_data(sql_query: str, df_name: str) -> str:
     finally:
         connection.close()
 
+
+class ReadData(BaseModel):
+    df_name: str = Field(description="指定用于保存结果的 pandas 变量名称（字符串形式）。")
+    file_path: str | None = Field(default=None, description="服务器本地文件路径（.csv）")
+    file_url: str | None = Field(default=None, description="文件的可直连 URL（含 LangSmith Studio 拖拽上传后的预签名链接）")
+    file_b64: str | None = Field(default=None, description="CSV 原始内容的 Base64 编码字符串")
+    csv_text: str | None = Field(default=None, description="纯文本的 CSV 内容（直接粘贴）")
+    sep: str | None = Field(default=None, description="分隔符，留空时自动嗅探。常见为 ',' 或 '\t'")
+    encoding: str | None = Field(default=None, description="文件编码，留空则由 pandas 猜测或使用系统默认")
+@tool(args_schema=ReadData)
+def read_data(
+    df_name: str,
+    file_path: str | None = None,
+    file_url: str | None = None,
+    file_b64: str | None = None,
+    csv_text: str | None = None,
+    sep: str | None = None,
+    encoding: str | None = None,
+):
+    """
+    用于读取 CSV 数据并保存为 pandas DataFrame。
+    支持以下来源（按优先级）：
+    1. file_path: 服务器本地路径
+    2. file_url: 直连 URL（包含 LangSmith Studio 拖拽上传后的预签名链接）
+    3. file_b64: Base64 编码的 CSV 字节内容
+    4. csv_text: 纯文本 CSV 内容
+    
+    :param df_name: DataFrame 在会话中的变量名
+    :return：表格读取与保存结果
+    """
+    print("正在调用 read_data 工具读取文件...")
+
+    try:
+        # pandas 自动嗅探分隔符需要 engine='python' 且 sep=None
+        read_kwargs = {}
+        if sep is None:
+            read_kwargs["sep"] = None
+            read_kwargs["engine"] = "python"
+        else:
+            read_kwargs["sep"] = sep
+        if encoding is not None:
+            read_kwargs["encoding"] = encoding
+
+        if file_path:
+            df = pd.read_csv(file_path, **read_kwargs)
+        elif file_url:
+            df = pd.read_csv(file_url, **read_kwargs)
+        elif file_b64:
+            try:
+                raw = base64.b64decode(file_b64)
+            except Exception as _:
+                return "❌ Base64 内容无法解码，请确认编码是否正确。"
+            df = pd.read_csv(io.BytesIO(raw), **read_kwargs)
+        elif csv_text:
+            df = pd.read_csv(io.StringIO(csv_text), **read_kwargs)
+        else:
+            return "⚠️ 未提供文件来源。请在 file_path、file_url、file_b64 或 csv_text 中至少提供一个。"
+
+        globals()[df_name] = df
+        return f"✅ 成功创建 pandas 对象 `{df_name}`，包含从 CSV 读取的数据，形状为 {df.shape}。"
+    except Exception as e:
+        return f"❌ 执行失败：{e}"
+
+
 # ✅创建Python代码执行工具
 # Python代码执行工具结构化参数说明
 class PythonCodeInput(BaseModel):
@@ -182,10 +253,9 @@ def fig_inter(py_code: str, fname: str) -> str:
 
     local_vars = {"plt": plt, "pd": pd, "sns": sns}
     
-    # ✅ 设置图像保存路径（你自己的绝对路径）
-    base_dir = r"C:\Users\Admin\Desktop\LangGraph App\data_agent\agent-chat-ui\public"
-    images_dir = os.path.join(base_dir, "images")
-    os.makedirs(images_dir, exist_ok=True)  # ✅ 自动创建 images 文件夹（如不存在）
+    # ✅ 设置图像保存路径（默认使用 IMAGE_OUTPUT_DIR）
+    images_dir = IMAGE_OUTPUT_DIR
+    os.makedirs(images_dir, exist_ok=True)
 
     try:
         g = globals()
@@ -195,10 +265,9 @@ def fig_inter(py_code: str, fname: str) -> str:
         fig = local_vars.get(fname, None)
         if fig:
             image_filename = f"{fname}.png"
-            abs_path = os.path.join(images_dir, image_filename)  # ✅ 绝对路径
-            rel_path = os.path.join("images", image_filename)    # ✅ 返回相对路径（给前端用）
-
+            abs_path = os.path.join(images_dir, image_filename)
             fig.savefig(abs_path, bbox_inches='tight')
+            rel_path = os.path.relpath(abs_path, os.getcwd())
             return f"✅ 图片已保存，路径为: {rel_path}"
         else:
             return "⚠️ 图像对象未找到，请确认变量名正确并为 matplotlib 图对象。"
@@ -234,9 +303,15 @@ prompt = """
 5. **网络搜索：**
    - 当用户提出与数据分析无关的问题（如最新新闻、实时信息），请调用`search_tool`工具。
 
+6. **文件读取（CSV）：**
+   - 当用户上传或提供 CSV 文件时，请调用`read_data`工具。
+   - 你可以从以下来源读取：`file_path`（本地路径）、`file_url`（如 LangSmith/LangGraph Studio 拖拽上传后生成的预签名链接）、`file_b64`（Base64 编码内容）或 `csv_text`（纯文本）。
+   - 读取后会在会话中创建名为 `df_name` 的 pandas 对象用于后续分析或绘图。
+
 **工具使用优先级：**
 - 如需数据库数据，请先使用`sql_inter`或`extract_data`获取，再执行Python分析或绘图。
 - 如需绘图，请先确保数据已加载为pandas对象。
+ - 如用户提供了 CSV，优先使用`read_data`加载为 DataFrame。
 
 **回答要求：**
 - 所有回答均使用**简体中文**，清晰、礼貌、简洁。
@@ -253,10 +328,103 @@ prompt = """
 """
 
 # ✅ 创建工具列表
-tools = [search_tool, python_inter, fig_inter, sql_inter, extract_data]
+tools = [search_tool, python_inter, fig_inter, sql_inter, extract_data, read_data]
 
 # ✅ 创建模型
 model = ChatDeepSeek(model="deepseek-chat")
 
 # ✅ 创建图 （Agent）
 graph = create_react_agent(model=model, tools=tools, prompt=prompt)
+
+
+def _content_to_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for chunk in content:
+            if isinstance(chunk, dict):
+                if "text" in chunk:
+                    parts.append(str(chunk.get("text")))
+                elif "content" in chunk:
+                    parts.append(str(chunk.get("content")))
+                else:
+                    parts.append(str(chunk))
+            else:
+                parts.append(str(chunk))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _print_last_ai_message(state) -> None:
+    messages = state.get("messages", [])
+    if not messages:
+        print("<no messages>")
+        return
+    last = messages[-1]
+    # AIMessage/AnyMessage from langchain_core
+    content = getattr(last, "content", None)
+    if content is None and isinstance(last, dict):
+        content = last.get("content")
+    print(_content_to_text(content))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run the data agent from the command line.")
+    parser.add_argument("--prompt", type=str, default=None, help="Single-turn user prompt. If omitted, enter interactive chat mode.")
+    parser.add_argument("--interactive", action="store_true", help="Force interactive mode even if --prompt is provided.")
+    parser.add_argument("--df_name", type=str, default="df", help="DataFrame variable name to store loaded CSV.")
+    parser.add_argument("--csv_path", type=str, default=None, help="Local CSV file path to preload.")
+    parser.add_argument("--csv_url", type=str, default=None, help="Direct URL of CSV (e.g., LangSmith/Studio presigned URL).")
+    parser.add_argument("--csv_b64", type=str, default=None, help="Base64-encoded CSV bytes to preload.")
+    parser.add_argument("--csv_text", type=str, default=None, help="Raw CSV text to preload.")
+    parser.add_argument("--sep", type=str, default=None, help="CSV delimiter (default: auto-detect).")
+    parser.add_argument("--encoding", type=str, default=None, help="CSV encoding (default: pandas guess).")
+    parser.add_argument("--images_dir", type=str, default=None, help="Directory to save figures. Overrides IMAGE_OUTPUT_DIR.")
+
+    args = parser.parse_args(argv)
+
+    # Override image output directory if provided
+    global IMAGE_OUTPUT_DIR
+    if args.images_dir:
+        IMAGE_OUTPUT_DIR = args.images_dir
+
+    # Optionally preload CSV into a DataFrame
+    if any([args.csv_path, args.csv_url, args.csv_b64, args.csv_text]):
+        # Use tool's invoke API per langchain-core >=0.1.47
+        result = read_data.invoke({
+            "df_name": args.df_name,
+            "file_path": args.csv_path,
+            "file_url": args.csv_url,
+            "file_b64": args.csv_b64,
+            "csv_text": args.csv_text,
+            "sep": args.sep,
+            "encoding": args.encoding,
+        })
+        print(str(result))
+
+    # Interactive mode if requested or no single prompt provided
+    if args.interactive or not args.prompt:
+        print("Interactive chat mode. Type 'exit' or 'quit' to leave.")
+        history = []
+        while True:
+            try:
+                user_input = input("You > ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nBye.")
+                return 0
+            if user_input.lower() in {"exit", "quit"}:
+                print("Bye.")
+                return 0
+            state = graph.invoke({"messages": (history + [("human", user_input)]) if history else [("human", user_input)]})
+            _print_last_ai_message(state)
+            history = state.get("messages", history)
+        # unreachable
+    else:
+        state = graph.invoke({"messages": [("human", args.prompt)]})
+        _print_last_ai_message(state)
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
