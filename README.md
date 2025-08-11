@@ -1,4 +1,4 @@
-## Data Agent 命令行使用指南
+## Data Agent 使用指南（包 + 命令行）
 
 - **环境准备**
   - Python 3.9+
@@ -16,13 +16,12 @@
     ```
 
 - **运行位置**
-  - 在项目根目录运行内层脚本：
+  - 作为模块运行（推荐）：
     ```bash
-    python data_agent/graph.py [OPTIONS]
+    python -m data_agent --interactive [OPTIONS]
     ```
-  - 或进入内层目录运行：
+  - 或在项目根目录使用兼容入口：
     ```bash
-    cd data_agent
     python graph.py [OPTIONS]
     ```
 
@@ -48,14 +47,14 @@
 
 - **示例：交互模式**
   ```bash
-  python data_agent/graph.py --interactive --csv_path telco_data.csv --df_name df
+  python -m data_agent --interactive --csv_path telco_data.csv --df_name df
   # 进入后直接对话：
   # You > 帮我看看 df 的缺失值比例，并给出前 5 行示例
   ```
 
 - **示例：指定图片输出目录（Windows）**
   ```bash
-  python data_agent/graph.py --csv_path telco_data.csv --df_name df --images_dir "E:\\AI Coding Explore\\data_agent\\outputs" --prompt "用 df 画 tenure 直方图并保存为 fig.png"
+  python -m data_agent --csv_path telco_data.csv --df_name df --images_dir "E:\\AI Coding Explore\\data_agent\\outputs" --prompt "用 df 画 tenure 直方图并保存为 fig.png"
   ```
 
 - **关于绘图（`fig_inter`）**
@@ -68,3 +67,26 @@
     ```bash
     python data_agent/graph.py --csv_url https://.../presigned.csv --df_name df --prompt "描述 df 的列信息与基本统计"
     ```
+
+---
+
+### 可编程 API
+
+作为包引入并以编程方式对话与作图：
+
+```python
+from data_agent import create_session, chat_once
+
+# 单轮对话
+print(chat_once(
+    "用 df 画 tenure 直方图并保存为 fig.png",
+    images_dir="./images",
+    preload={"df_name": "df", "file_path": "telco_data.csv"}
+))
+
+# 会话式（多轮）
+session = create_session(images_dir="./images")
+print(session.preload_csv(df_name="df", file_path="telco_data.csv"))
+print(session.send("查看 df 的列和行数"))
+print(session.send("用 df 画 tenure 的直方图，保存为 fig.png"))
+```
