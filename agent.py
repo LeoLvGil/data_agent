@@ -244,6 +244,12 @@ prompt = (
    - 当用户上传或提供 CSV 文件时，请调用`read_data`工具。
 
 回答要求：简体中文、简洁清晰；若生成图片，请返回 Markdown 图片链接（相对路径）。
+\n
+重要指令（必须遵守）：
+- 如果对话中出现一条 system 提示，明确告知已经在当前 Python 进程中存在某个 pandas DataFrame（例如 `df`），你应当直接基于该 DataFrame 开展分析，严禁再次要求用户上传或读取 CSV。
+- 当用户提出“行数/列数/列名/基本统计”等问题时，直接调用 `python_inter` 在当前变量上执行相应代码，如：
+  - 行数：`len(df)`；形状：`df.shape`；列名：`list(df.columns)`；类型：`df.dtypes.astype(str).to_dict()`；预览：`df.head(5)`；统计：`df.describe(include='all')`
+- 当用户需要可视化时，调用 `fig_inter`，并确保将图对象赋值给变量（如 `fig`），由工具保存到图片目录后返回相对路径。
 """
 )
 
@@ -355,7 +361,26 @@ class DataAgentSession:
             "sep": sep,
             "encoding": encoding,
         }
-        return str(read_data.invoke(payload))
+        result = str(read_data.invoke(payload))
+        # 在成功加载后，注入一条 system 消息，告知模型 df 的存在与基本信息
+        try:
+            df = globals().get(df_name)
+            if hasattr(df, "shape") and hasattr(df, "columns"):
+                rows, cols = getattr(df, "shape", (None, None))
+                col_list = list(getattr(df, "columns", []))
+                col_preview = ", ".join(map(str, col_list[:20]))
+                more = "" if len(col_list) <= 20 else f", ... (共 {len(col_list)} 列)"
+                sys_note = (
+                    f"已加载 CSV 到 pandas DataFrame 变量 `{df_name}`，形状为 ({rows}, {cols})，部分列名：{col_preview}{more}。\n"
+                    f"后续请直接使用 `{df_name}` 变量进行分析（如 `python_inter` 执行 `print({df_name}.head())`、`{df_name}.describe()` 等），"
+                    f"绘图请调用 `fig_inter` 并将图对象保存为 PNG。"
+                )
+                # 追加一条 system 提示，帮助 Agent 感知上下文数据
+                self.history.append(("system", sys_note))
+        except Exception:
+            # 静默失败，不影响主流程
+            pass
+        return result
 
     def send(self, user_input: str) -> str:
         state = graph.invoke({
